@@ -1,0 +1,148 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [ published ]
+
+jobs:
+  build-liboqs:
+    name: Build liboqs ${{ matrix.os }}-${{ matrix.qemu }}
+    runs-on: ${{ matrix.os }}-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ ubuntu, windows, macos ]
+        python: [ "cp312" ]
+        qemu: [ "" ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: open-quantum-safe/liboqs
+          ref: 0.11.0
+
+      - name: Set up QEMU
+        if: ${{ matrix.qemu }}
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+        id: qemu
+
+      - name: Prepare emulation
+        run: |
+          if [[ -n "${{ matrix.qemu }}" ]]; then
+            # Build emulated architectures only if QEMU is set,
+            # use default "auto" otherwise
+            echo "CIBW_ARCHS_LINUX=${{ matrix.qemu }}" >> $GITHUB_ENV
+          fi
+        shell: bash
+
+      - name: Build liboqs ubuntu
+        if: matrix.os == 'ubuntu'
+        run: |
+          docker run --rm -v $(pwd):/project quay.io/pypa/manylinux_2_28_x86_64 /bin/bash -c "
+          dnf install -y openssl-devel &&
+          cd /project &&
+          cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DOQS_BUILD_ONLY_LIB=ON -DCMAKE_BUILD_TYPE=Release -DOQS_MINIMAL_BUILD='KEM_kyber_512;SIG_dilithium_3' -DOQS_USE_OPENSSL=OFF -DCMAKE_INSTALL_PREFIX=artifacts &&
+          cmake --build build --parallel 8 &&
+          cmake --build build --target install
+          "
+
+      - name: Build liboqs windows
+        if: matrix.os == 'windows'
+        run: |
+          cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DOQS_BUILD_ONLY_LIB=ON -DCMAKE_BUILD_TYPE=Release -DOQS_MINIMAL_BUILD="KEM_kyber_512;SIG_dilithium_3" -DCMAKE_INSTALL_PREFIX=artifacts -DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE
+          cmake --build build --parallel 8
+          cmake --build build --target install
+
+      - name: Build liboqs macos
+        if: matrix.os == 'macos'
+        run: |
+          cmake -S . -B build -DBUILD_SHARED_LIBS=ON -DOQS_BUILD_ONLY_LIB=ON -DCMAKE_BUILD_TYPE=Release -DOQS_MINIMAL_BUILD="KEM_kyber_512;SIG_dilithium_3" -DCMAKE_INSTALL_PREFIX=artifacts
+          cmake --build build --parallel 8
+          cmake --build build --target install
+
+      - name: Upload liboqs artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-${{ matrix.qemu }}-liboqs
+          path: ./artifacts/${{ matrix.os == 'windows' && 'bin/*.dll' || matrix.os == 'ubuntu' && 'lib64/*.so*' || matrix.os == 'macos' && 'lib/*.dylib*' }}
+
+  build-wheel:
+    name: Build wheel ${{ matrix.python }}-${{ matrix.os }}-${{ matrix.qemu }}
+    needs: [ build-liboqs ]
+    runs-on: ${{ matrix.os }}-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ ubuntu, windows, macos ]
+        python: [ "cp312" ]
+        qemu: [ "" ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download liboqs artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ runner.os }}-${{ matrix.qemu }}-liboqs
+          path: ./oqs/
+
+      - name: Build wheel linux
+        if: matrix.os == 'ubuntu'
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: "cp312-manylinux_x86_64"
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+
+      - name: Build wheel windows
+        if: matrix.os == 'windows'
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: "cp312-win_amd64"
+
+      - name: Build wheel macos
+        if: matrix.os == 'macos'
+        uses: pypa/cibuildwheel@v2.21.3
+        env:
+          CIBW_BUILD: "cp312-macosx_arm64"
+          MACOSX_DEPLOYMENT_TARGET: 14.0
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ runner.os }}-${{ matrix.qemu }}
+          path: ./wheelhouse/*.whl
+
+  publish:
+    name: Publish to PyPI
+    needs: [ build-wheel ]
+    runs-on: ubuntu-22.04
+    env:
+      UV_PYTHON: "3.12.7"
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pqcow-liboqs
+    permissions:
+      id-token: write  # IMPORTANT: mandatory for trusted publishing
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python ${{ env.UV_PYTHON }}
+        run: uv python install ${{ env.UV_PYTHON }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ~/dist
+
+      - name: 🐍 Publish distribution 📦
+        run: |
+          ls -la ~/dist
+          uv publish ~/dist/**/*.{whl,tar.gz}

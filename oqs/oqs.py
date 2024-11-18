@@ -14,16 +14,12 @@ import ctypes.util as ctu
 import importlib.metadata  # to determine module version at runtime
 import logging
 import platform  # to learn the OS we're on
-import subprocess
 import sys
-import tempfile  # to install liboqs on demand
-import time
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Final, TypeVar, cast
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from types import TracebackType
 
 TKeyEncapsulation = TypeVar("TKeyEncapsulation", bound="KeyEncapsulation")
@@ -33,56 +29,45 @@ logger = logging.getLogger(__name__)
 
 
 def oqs_python_version() -> str | None:
-    """liboqs-python version string."""
+    """pqcow-liboqs version string."""
     try:
-        result = importlib.metadata.version("liboqs-python")
+        result = importlib.metadata.version("pqcow-liboqs")
     except importlib.metadata.PackageNotFoundError:
-        warnings.warn("Please install liboqs-python using pip install", stacklevel=2)
+        warnings.warn("Please install pqcow-liboqs using pip install", stacklevel=2)
         return None
     return result
 
 
-# liboqs-python tries to automatically install and load this liboqs version in
+# pqcow-liboqs tries to automatically install and load this liboqs version in
 # case no other version is found
 OQS_VERSION = oqs_python_version()
 
 
-def _countdown(seconds: int) -> None:
-    while seconds > 0:
-        logger.info("Installing in %s seconds...", seconds)
-        sys.stdout.flush()
-        seconds -= 1
-        time.sleep(1)
-
-
-def _load_shared_obj(
-    name: str,
-    additional_searching_paths: Sequence[Path] | None = None,
-) -> ct.CDLL:
+def _load_shared_obj(name: str, oqs_path_dir: Path | None = None) -> ct.CDLL:
     """Attempt to load shared library."""
     paths: list[Path] = []
     dll = ct.windll if platform.system() == "Windows" else ct.cdll
 
-    # Search additional path, if any
-    if additional_searching_paths:
-        for path in additional_searching_paths:
-            if platform.system() == "Darwin":
-                paths.append(path.absolute() / Path(f"lib{name}").with_suffix(".dylib"))
-            elif platform.system() == "Windows":
-                paths.append(path.absolute() / Path(name).with_suffix(".dll"))
-                # Does not work
-                # os.environ["PATH"] += os.path.abspath(path)
-            else:  # Linux/FreeBSD/UNIX
-                paths.append(path.absolute() / Path(f"lib{name}").with_suffix(".so"))
-                # https://stackoverflow.com/questions/856116/changing-ld-library-path-at-runtime-for-ctypes
-                # os.environ["LD_LIBRARY_PATH"] += os.path.abspath(path)
+    if oqs_path_dir and oqs_path_dir.exists():
+        if not oqs_path_dir.is_dir():
+            msg = f"{oqs_path_dir} is not a directory"
+            raise RuntimeError(msg)
+
+        if platform.system() == "Darwin":
+            paths.append(oqs_path_dir.absolute() / Path(f"lib{name}").with_suffix(".dylib"))
+        elif platform.system() == "Windows":
+            paths.append(oqs_path_dir.absolute() / Path(name).with_suffix(".dll"))
+        elif platform.system() == "Linux":
+            paths.append(oqs_path_dir.absolute() / Path(f"lib{name}").with_suffix(".so"))
+        else:
+            msg = f"Unsupported platform: {platform.system()}"
+            raise RuntimeError(msg)
 
     # Search typical locations
-
     if found_lib := ctu.find_library(name):
         paths.insert(0, Path(found_lib))
 
-    if found_lib := ctu.find_library("lib" + name):
+    if found_lib := ctu.find_library(f"lib{name}"):
         paths.insert(0, Path(found_lib))
 
     for path in paths:
@@ -99,96 +84,20 @@ def _load_shared_obj(
     raise RuntimeError(msg)
 
 
-def _install_liboqs(target_directory: Path, oqs_version_to_install: str | None = None) -> None:
-    """Install liboqs version oqs_version (if None, installs latest at HEAD) in the target_directory."""  # noqa: E501
-    with tempfile.TemporaryDirectory() as tmpdirname:
-        oqs_install_cmd = [
-            "cd",
-            tmpdirname,
-            "&&",
-            "git",
-            "clone",
-            "https://github.com/open-quantum-safe/liboqs",
-        ]
-        if oqs_version_to_install:
-            oqs_install_cmd.extend(["--branch", oqs_version_to_install])
-
-        oqs_install_cmd.extend(
-            [
-                "--depth",
-                "1",
-                "&&",
-                "cmake",
-                "-S",
-                "liboqs",
-                "-B",
-                "liboqs/build",
-                "-DBUILD_SHARED_LIBS=ON",
-                "-DOQS_BUILD_ONLY_LIB=ON",
-                f"-DCMAKE_INSTALL_PREFIX={target_directory}",
-            ],
-        )
-
-        if platform.system() == "Windows":
-            oqs_install_cmd.append("-DCMAKE_WINDOWS_EXPORT_ALL_SYMBOLS=TRUE")
-
-        oqs_install_cmd.extend(
-            [
-                "&&",
-                "cmake",
-                "--build",
-                "liboqs/build",
-                "--parallel",
-                "4",
-                "&&",
-                "cmake",
-                "--build",
-                "liboqs/build",
-                "--target",
-                "install",
-            ],
-        )
-        logger.info("liboqs not found, installing it in %s", str(target_directory))
-        _countdown(5)
-
-        _retcode = subprocess.call(" ".join(oqs_install_cmd), shell=True)  # noqa: S602
-
-        if _retcode != 0:
-            logger.exception("Error installing liboqs.")
-            sys.exit(1)
-
-        logger.info("Done installing liboqs")
-
-
-def _load_liboqs() -> ct.CDLL:
-    home_dir = Path.home()
-    oqs_install_dir = home_dir / "_oqs"
-    oqs_lib_dir = (
-        oqs_install_dir / "bin"  # $HOME/_oqs/bin
-        if platform.system() == "Windows"
-        else oqs_install_dir / "lib"  # $HOME/_oqs/lib
-    )
+def _load_liboqs(name: str = "oqs", oqs_path: Path | None = None) -> ct.CDLL:
     try:
-        liboqs = _load_shared_obj(name="oqs", additional_searching_paths=[oqs_lib_dir])
+        liboqs = _load_shared_obj(
+            name=name,
+            oqs_path_dir=oqs_path or Path(__file__).parent,
+        )
         assert liboqs  # noqa: S101
     except RuntimeError:
-        # We don't have liboqs, so we try to install it automatically
-        _install_liboqs(target_directory=oqs_install_dir, oqs_version_to_install=OQS_VERSION)
-        # Try loading it again
-        try:
-            liboqs = _load_shared_obj(
-                name="oqs",
-                additional_searching_paths=[oqs_lib_dir],
-            )
-            assert liboqs  # noqa: S101
-        except RuntimeError:
-            sys.exit("Could not load liboqs shared library")
+        sys.exit("Could not load liboqs shared library")
 
     return liboqs
 
 
 _liboqs = _load_liboqs()
-
 
 # Expected return value from native OQS functions
 OQS_SUCCESS: Final[int] = 0
@@ -210,10 +119,10 @@ def oqs_version() -> str:
     return ct.c_char_p(native().OQS_version()).value.decode("UTF-8")  # type: ignore[union-attr]
 
 
-# Warn the user if the liboqs version differs from liboqs-python version
+# Warn the user if the liboqs version differs from pqcow-liboqs version
 if oqs_version() != oqs_python_version():
     warnings.warn(
-        f"liboqs version {oqs_version()} differs from liboqs-python version "
+        f"liboqs version {oqs_version()} differs from pqcow-liboqs version "
         f"{oqs_python_version()}",
         stacklevel=2,
     )
